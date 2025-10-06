@@ -7,10 +7,10 @@
 package customerimporter
 
 import (
+	"bufio"
 	"cmp"
-	"encoding/csv"
 	"fmt"
-	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -22,54 +22,97 @@ type DomainData struct {
 }
 
 type CustomerImporter struct {
-	path *string
+	path string
 }
 
 // NewCustomerImporter returns a new CustomerImporter that reads from file at specified path.
-func NewCustomerImporter(filePath *string) *CustomerImporter {
+func NewCustomerImporter(filePath string) *CustomerImporter {
 	return &CustomerImporter{
 		path: filePath,
 	}
 }
 
 // ImportDomainData reads and returns sorted customer domain data from CSV file.
+// Uses optimized streaming algorithm with buffered IO for best performance across all file sizes
 func (ci CustomerImporter) ImportDomainData() ([]DomainData, error) {
-	file, err := os.Open(*ci.path)
+	// Validate input path
+	if ci.path == "" {
+		slog.Error("import validation failed", "reason", "file path is empty")
+		return nil, fmt.Errorf("file path cannot be empty")
+	}
+
+	file, err := os.Open(ci.path)
 	if err != nil {
-		return nil, err
+		slog.Error("failed to open input file", "path", ci.path, "error", err)
+		return nil, fmt.Errorf("failed to open file %s: %w", ci.path, err)
 	}
 	defer file.Close()
-	csvReader := csv.NewReader(file)
-	data := make(map[string]uint64)
 
-	// skip first line with headers
-	line, readErr := csvReader.Read()
-	if readErr != nil {
-		fmt.Println(line, readErr)
-		return nil, readErr
-	}
-	for line, readErr := csvReader.Read(); readErr != io.EOF; line, readErr = csvReader.Read() {
-		if readErr != nil {
-			return nil, readErr
+	// Use buffered scanner for optimal IO performance
+	scanner := bufio.NewScanner(file)
+
+	// reduce rehashing
+	domainCounts := make(map[string]uint64, 1000)
+
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			slog.Error("failed to read header", "path", ci.path, "error", err)
+			return nil, fmt.Errorf("failed to read header from %s: %w", ci.path, err)
 		}
-		// Skip rows with invalid email addresses but continue processing
-		if len(line) < 3 {
+		slog.Error("input file is empty", "path", ci.path)
+		return nil, fmt.Errorf("file %s appears to be empty", ci.path)
+	}
+
+	// Process lines with optimized string operations
+	linesProcessed := 0
+	validEmails := 0
+	invalidEmails := 0
+
+	for scanner.Scan() {
+		linesProcessed++
+		line := scanner.Text()
+
+		// Fast CSV parsing - split by comma
+		fields := strings.Split(line, ",")
+		if len(fields) < 3 {
+			invalidEmails++
 			continue
 		}
-		email, domain, found := strings.Cut(line[2], "@")
-		if email == "" || !found || domain == "" {
-			// Log invalid email but continue processing
+
+		email := fields[2]
+
+		// Fast domain extraction using IndexByte for optimal performance
+		atIndex := strings.IndexByte(email, '@')
+		if atIndex == -1 || atIndex == 0 || atIndex == len(email)-1 {
+			invalidEmails++
 			continue
 		}
-		data[domain] += 1
+
+		domain := email[atIndex+1:]
+		if domain == "" {
+			invalidEmails++
+			continue
+		}
+
+		domainCounts[domain]++
+		validEmails++
 	}
-	domainData := make([]DomainData, 0, len(data))
-	for k, v := range data {
+
+	if err := scanner.Err(); err != nil {
+		slog.Error("scanner error during file processing", "path", ci.path, "error", err)
+		return nil, fmt.Errorf("error reading file %s: %w", ci.path, err)
+	}
+
+	// Convert to slice with pre-allocated capacity
+	domainData := make([]DomainData, 0, len(domainCounts))
+	for domain, count := range domainCounts {
 		domainData = append(domainData, DomainData{
-			Domain:           k,
-			CustomerQuantity: v,
+			Domain:           domain,
+			CustomerQuantity: count,
 		})
 	}
+
+	// Optimized sorting using slices.SortFunc
 	slices.SortFunc(domainData, func(l, r DomainData) int {
 		return cmp.Compare(l.Domain, r.Domain)
 	})
